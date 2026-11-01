@@ -2,6 +2,13 @@
 import os
 import logging
 import threading
+import tempfile
+import subprocess
+import hashlib
+import heapq
+import shutil
+import contextlib
+from pathlib import Path
 import click
 import mapreduce.utils
 
@@ -11,6 +18,79 @@ LOGGER = logging.getLogger(__name__)
 
 # Seconds between heartbeats, from the spec.
 HEARTBEAT_INTERVAL = 2
+
+
+def partition_number(key, num_partitions):
+    """Return which reducer handles key (same key -> same partition)."""
+    hexdigest = hashlib.md5(key.encode("utf-8")).hexdigest()
+    keyhash = int(hexdigest, base=16)
+    return keyhash % num_partitions
+
+
+def map_into_partitions(task, outfiles):
+    """Run the map executable on every input file.
+
+    Stream its output line by line into outfiles[partition], so memory use
+    stays O(1) no matter how much the mapper prints.
+    """
+    for input_path in task["input_paths"]:
+        with open(input_path, encoding="utf-8") as infile:
+            with subprocess.Popen(
+                [task["executable"]],
+                stdin=infile,
+                stdout=subprocess.PIPE,
+                text=True,
+            ) as map_process:
+                for line in map_process.stdout:
+                    key = line.partition("\t")[0]
+                    outfiles[partition_number(key, len(outfiles))].write(line)
+        LOGGER.info("Executed %s input=%s", task["executable"], input_path)
+
+
+def run_map_task(task, tmpdir):
+    """Map, partition, and sort into tmpdir; return the output paths."""
+    task_id = task["task_id"]
+    paths = [
+        tmpdir / f"maptask{task_id:05d}-part{partition:05d}"
+        for partition in range(task["num_partitions"])
+    ]
+
+    # One open output file per partition, all closed when the block ends.
+    with contextlib.ExitStack() as stack:
+        outfiles = [
+            stack.enter_context(path.open("w", encoding="utf-8"))
+            for path in paths
+        ]
+        map_into_partitions(task, outfiles)
+
+    # Sort in a separate process so this one never holds a whole file.
+    for path in paths:
+        subprocess.run(["sort", "-o", str(path), str(path)], check=True)
+        LOGGER.info("Sorted %s", path)
+    return paths
+
+
+def run_reduce_task(task, tmpdir):
+    """Merge the sorted inputs into the reducer; return the output path."""
+    path = tmpdir / f"part-{task['task_id']:05d}"
+    with contextlib.ExitStack() as stack:
+        infiles = [
+            stack.enter_context(open(input_path, encoding="utf-8"))
+            for input_path in task["input_paths"]
+        ]
+        outfile = stack.enter_context(path.open("w", encoding="utf-8"))
+        with subprocess.Popen(
+            [task["executable"]],
+            text=True,
+            stdin=subprocess.PIPE,
+            stdout=outfile,
+        ) as reduce_process:
+            # heapq.merge reads one line at a time from each sorted file
+            # and yields them in overall sorted order.
+            for line in heapq.merge(*infiles):
+                reduce_process.stdin.write(line)
+    LOGGER.info("Executed %s", task["executable"])
+    return [path]
 
 
 class Worker:
@@ -68,8 +148,38 @@ class Worker:
             self.shutdown_event.set()
         elif message_type == "register_ack":
             self.start_heartbeats()
+        elif message_type == "new_map_task":
+            self.run_task(task=message, run_func=run_map_task)
+        elif message_type == "new_reduce_task":
+            self.run_task(task=message, run_func=run_reduce_task)
         else:
             LOGGER.warning("Unhandled message_type %s", message_type)
+
+    def run_task(self, task, run_func):
+        """Run a map or reduce task in a private tmpdir, then report back.
+
+        run_func writes its output files into the tmpdir and returns their
+        paths; we move them to the task's output directory.
+        """
+        task_id = task["task_id"]
+        prefix = f"mapreduce-local-task{task_id:05d}-"
+        with tempfile.TemporaryDirectory(prefix=prefix) as tmpdir:
+            LOGGER.info("Created %s", tmpdir)
+            output_dir = Path(task["output_directory"])
+            for path in run_func(task, Path(tmpdir)):
+                shutil.move(path, output_dir / path.name)
+                LOGGER.info("Moved %s -> %s", path, output_dir / path.name)
+        LOGGER.info("Removed %s", tmpdir)
+
+        try:
+            mapreduce.utils.tcp_send(self.manager_address, {
+                "message_type": "finished",
+                "task_id": task_id,
+                "worker_host": self.address[0],
+                "worker_port": self.address[1],
+            })
+        except ConnectionRefusedError:
+            LOGGER.error("Can't reach Manager to report task %s", task_id)
 
     def start_heartbeats(self):
         """Start the heartbeat thread, unless it's already running."""
