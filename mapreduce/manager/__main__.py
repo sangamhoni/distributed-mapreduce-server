@@ -3,7 +3,6 @@ import os
 import tempfile
 import logging
 import json
-import socket
 import threading
 import queue
 import shutil
@@ -47,13 +46,6 @@ class Stage:
     remaining: int = 0  # assigned or not, but not finished yet
 
 
-def tcp_send(host, port, message):
-    """Send one JSON message to host:port over a new TCP connection."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.connect((host, port))
-        sock.sendall(json.dumps(message).encode("utf-8"))
-
-
 def make_map_tasks(job, job_dir):
     """Split a job's input files round robin into new_map_task messages."""
     input_files = sorted(Path(job["input_directory"]).iterdir())
@@ -91,33 +83,6 @@ def make_reduce_tasks(job, job_dir):
     return tasks
 
 
-def receive_all(clientsocket):
-    """Read bytes from a TCP connection until the sender closes it."""
-    clientsocket.settimeout(1)
-    with clientsocket:
-        message_chunks = []
-        while True:
-            try:
-                data = clientsocket.recv(4096)
-            except socket.timeout:
-                continue
-            if not data:
-                break
-            message_chunks.append(data)
-    return b"".join(message_chunks)
-
-
-def decode_message(message_bytes):
-    """Return the message as a dict, or None if it isn't valid JSON."""
-    try:
-        message = json.loads(message_bytes.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
-    if not isinstance(message, dict):
-        return None
-    return message
-
-
 class Manager:
     """Represent a MapReduce framework Manager node."""
 
@@ -148,7 +113,11 @@ class Manager:
             self.tmpdir = Path(tmpdir)
 
             # Heartbeats arrive over UDP in a background thread.
-            heartbeat_thread = threading.Thread(target=self.listen_udp)
+            heartbeat_thread = threading.Thread(
+                target=mapreduce.utils.udp_server,
+                args=(self.address, self.shutdown_event,
+                      self.handle_heartbeat),
+            )
             heartbeat_thread.start()
 
             # Jobs run one at a time in their own background thread.
@@ -157,52 +126,18 @@ class Manager:
 
             # Commands arrive over TCP in this (main) thread.  This call
             # blocks until shutdown.
-            self.listen_tcp()
+            mapreduce.utils.tcp_server(
+                self.address, self.shutdown_event, self.handle_message
+            )
 
             # Don't leave the constructor until every thread has stopped.
             heartbeat_thread.join()
             job_thread.join()
         LOGGER.info("Cleaned up tmpdir %s", tmpdir)
 
-    def listen_tcp(self):
-        """Accept TCP connections and handle one JSON message from each."""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(self.address)
-            sock.listen()
-            sock.settimeout(1)
-            LOGGER.info("Listening on TCP port %s", self.address[1])
-
-            while not self.shutdown_event.is_set():
-                try:
-                    clientsocket, _ = sock.accept()
-                except socket.timeout:
-                    continue
-
-                message = decode_message(receive_all(clientsocket))
-                if message is None:
-                    continue
-                LOGGER.debug("TCP recv\n%s", json.dumps(message, indent=2))
-                self.handle_message(message)
-
-    def listen_udp(self):
-        """Receive UDP heartbeat messages until shutdown."""
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(self.address)
-            sock.settimeout(1)
-            LOGGER.info("Listening on UDP port %s", self.address[1])
-
-            while not self.shutdown_event.is_set():
-                try:
-                    message_bytes = sock.recv(4096)
-                except socket.timeout:
-                    continue
-
-                message = decode_message(message_bytes)
-                if message is None:
-                    continue
-                LOGGER.debug("UDP recv\n%s", json.dumps(message, indent=2))
+    def handle_heartbeat(self, message):
+        """Handle one UDP heartbeat (tracking comes with fault tolerance)."""
+        LOGGER.debug("UDP recv\n%s", json.dumps(message, indent=2))
 
     def handle_message(self, message):
         """Dispatch one TCP message based on its message_type."""
@@ -252,7 +187,7 @@ class Manager:
         Return True if the message was sent.
         """
         try:
-            tcp_send(worker.host, worker.port, message)
+            mapreduce.utils.tcp_send((worker.host, worker.port), message)
         except ConnectionRefusedError:
             LOGGER.warning("Connection refused, marking dead %s", worker)
             worker.state = "dead"
