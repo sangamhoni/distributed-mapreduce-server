@@ -19,6 +19,10 @@ LOGGER = logging.getLogger(__name__)
 # Seconds between heartbeats, from the spec.
 HEARTBEAT_INTERVAL = 2
 
+# Bytes buffered per open file or pipe.  Set explicitly because newer Pythons
+# default to 128 KiB, which adds up quickly with one file per partition.
+BUFFER_SIZE = 8192
+
 
 def partition_number(key, num_partitions):
     """Return which reducer handles key (same key -> same partition)."""
@@ -40,8 +44,13 @@ def map_into_partitions(task, outfiles):
                 stdin=infile,
                 stdout=subprocess.PIPE,
                 text=True,
+                bufsize=BUFFER_SIZE,
             ) as map_process:
                 for line in map_process.stdout:
+                    if not line.endswith("\n"):
+                        # Last line without a newline; don't let it run
+                        # into the next line written to the same file.
+                        line += "\n"
                     key = line.partition("\t")[0]
                     outfiles[partition_number(key, len(outfiles))].write(line)
         LOGGER.info("Executed %s input=%s", task["executable"], input_path)
@@ -58,7 +67,9 @@ def run_map_task(task, tmpdir):
     # One open output file per partition, all closed when the block ends.
     with contextlib.ExitStack() as stack:
         outfiles = [
-            stack.enter_context(path.open("w", encoding="utf-8"))
+            stack.enter_context(
+                path.open("w", encoding="utf-8", buffering=BUFFER_SIZE)
+            )
             for path in paths
         ]
         map_into_partitions(task, outfiles)
@@ -75,7 +86,9 @@ def run_reduce_task(task, tmpdir):
     path = tmpdir / f"part-{task['task_id']:05d}"
     with contextlib.ExitStack() as stack:
         infiles = [
-            stack.enter_context(open(input_path, encoding="utf-8"))
+            stack.enter_context(open(
+                input_path, encoding="utf-8", buffering=BUFFER_SIZE
+            ))
             for input_path in task["input_paths"]
         ]
         outfile = stack.enter_context(path.open("w", encoding="utf-8"))
@@ -84,6 +97,7 @@ def run_reduce_task(task, tmpdir):
             text=True,
             stdin=subprocess.PIPE,
             stdout=outfile,
+            bufsize=BUFFER_SIZE,
         ) as reduce_process:
             # heapq.merge reads one line at a time from each sorted file
             # and yields them in overall sorted order.
