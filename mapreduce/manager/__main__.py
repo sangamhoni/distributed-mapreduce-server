@@ -73,6 +73,24 @@ def make_map_tasks(job, job_dir):
     return tasks
 
 
+def make_reduce_tasks(job, job_dir):
+    """Group the map output files by partition into new_reduce_task messages.
+
+    Reduce task N gets every map task's partition-N file.
+    """
+    tasks = []
+    for task_id in range(job["num_reducers"]):
+        input_paths = sorted(job_dir.glob(f"maptask*-part{task_id:05d}"))
+        tasks.append({
+            "message_type": "new_reduce_task",
+            "task_id": task_id,
+            "executable": job["reducer_executable"],
+            "input_paths": [str(path) for path in input_paths],
+            "output_directory": job["output_directory"],
+        })
+    return tasks
+
+
 def receive_all(clientsocket):
     """Read bytes from a TCP connection until the sender closes it."""
     clientsocket.settimeout(1)
@@ -275,6 +293,18 @@ class Manager:
         if self.shutdown_event.is_set():
             return
         LOGGER.info("End Map Stage")
+
+        LOGGER.info("Begin Reduce Stage")
+        self.run_stage(make_reduce_tasks(job, job_dir))
+        if self.shutdown_event.is_set():
+            return
+        LOGGER.info("End Reduce Stage")
+
+        # Intermediate files aren't needed once the output is written.
+        shutil.rmtree(job_dir)
+        LOGGER.info("Removed %s", job_dir)
+        LOGGER.info("Finished job %s. Output directory: %s",
+                    job["job_id"], output_dir)
 
     def run_stage(self, tasks):
         """Give tasks to ready Workers; return when all have finished.
