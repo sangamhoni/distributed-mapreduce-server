@@ -15,7 +15,7 @@ def reduce_one_group(key, group):
     for line in group:
         count = line.partition("\t")[2]
         word_count += int(count)
-    print(f"{key} {word_count}")
+    print(f"{key}\t{word_count}")
 
 
 def keyfunc(line):

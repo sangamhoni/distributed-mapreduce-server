@@ -3,7 +3,9 @@ import os
 import tempfile
 import logging
 import json
-import time
+import socket
+import threading
+from dataclasses import dataclass
 import click
 import mapreduce.utils
 
@@ -12,29 +14,163 @@ import mapreduce.utils
 LOGGER = logging.getLogger(__name__)
 
 
+@dataclass
+class RemoteWorker:
+    """The Manager's view of one registered Worker."""
+
+    host: str
+    port: int
+    state: str = "ready"  # "ready", "busy", or "dead"
+
+
+def tcp_send(host, port, message):
+    """Send one JSON message to host:port over a new TCP connection."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.connect((host, port))
+        sock.sendall(json.dumps(message).encode("utf-8"))
+
+
+def receive_all(clientsocket):
+    """Read bytes from a TCP connection until the sender closes it."""
+    clientsocket.settimeout(1)
+    with clientsocket:
+        message_chunks = []
+        while True:
+            try:
+                data = clientsocket.recv(4096)
+            except socket.timeout:
+                continue
+            if not data:
+                break
+            message_chunks.append(data)
+    return b"".join(message_chunks)
+
+
+def decode_message(message_bytes):
+    """Return the message as a dict, or None if it isn't valid JSON."""
+    try:
+        message = json.loads(message_bytes.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(message, dict):
+        return None
+    return message
+
+
 class Manager:
     """Represent a MapReduce framework Manager node."""
 
     def __init__(self, host, port):
         """Construct a Manager instance and start listening for messages."""
-
         LOGGER.info(
             "Starting manager host=%s port=%s pwd=%s",
             host, port, os.getcwd(),
         )
+        self.host = host
+        self.port = port
 
-        # This is a fake message to demonstrate pretty printing with logging
-        message_dict = {
-            "message_type": "register",
-            "worker_host": "localhost",
-            "worker_port": 6001,
-        }
-        LOGGER.debug("TCP recv\n%s", json.dumps(message_dict, indent=2))
+        # Every thread checks this flag; setting it tells them all to stop.
+        self.shutdown_event = threading.Event()
 
-        # TODO: you should remove this. This is just so the program doesn't
-        # exit immediately!
-        LOGGER.debug("IMPLEMENT ME!")
-        time.sleep(120)
+        # Registered Workers keyed by (host, port), in registration order.
+        self.workers = mapreduce.utils.ThreadSafeOrderedDict()
+
+        prefix = "mapreduce-shared-"
+        with tempfile.TemporaryDirectory(prefix=prefix) as tmpdir:
+            LOGGER.info("Created tmpdir %s", tmpdir)
+            self.tmpdir = tmpdir
+
+            # Heartbeats arrive over UDP in a background thread.
+            heartbeat_thread = threading.Thread(target=self.listen_udp)
+            heartbeat_thread.start()
+
+            # Commands arrive over TCP in this (main) thread.  This call
+            # blocks until shutdown.
+            self.listen_tcp()
+
+            # Don't leave the constructor until every thread has stopped.
+            heartbeat_thread.join()
+        LOGGER.info("Cleaned up tmpdir %s", tmpdir)
+
+    def listen_tcp(self):
+        """Accept TCP connections and handle one JSON message from each."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((self.host, self.port))
+            sock.listen()
+            sock.settimeout(1)
+            LOGGER.info("Listening on TCP port %s", self.port)
+
+            while not self.shutdown_event.is_set():
+                try:
+                    clientsocket, _ = sock.accept()
+                except socket.timeout:
+                    continue
+
+                message = decode_message(receive_all(clientsocket))
+                if message is None:
+                    continue
+                LOGGER.debug("TCP recv\n%s", json.dumps(message, indent=2))
+                self.handle_message(message)
+
+    def listen_udp(self):
+        """Receive UDP heartbeat messages until shutdown."""
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((self.host, self.port))
+            sock.settimeout(1)
+            LOGGER.info("Listening on UDP port %s", self.port)
+
+            while not self.shutdown_event.is_set():
+                try:
+                    message_bytes = sock.recv(4096)
+                except socket.timeout:
+                    continue
+
+                message = decode_message(message_bytes)
+                if message is None:
+                    continue
+                LOGGER.debug("UDP recv\n%s", json.dumps(message, indent=2))
+
+    def handle_message(self, message):
+        """Dispatch one TCP message based on its message_type."""
+        message_type = message.get("message_type")
+        if message_type == "shutdown":
+            self.shutdown()
+        elif message_type == "register":
+            self.register_worker(message)
+        else:
+            LOGGER.warning("Unhandled message_type %s", message_type)
+
+    def register_worker(self, message):
+        """Record a new Worker and acknowledge it."""
+        host = message["worker_host"]
+        port = message["worker_port"]
+        worker = RemoteWorker(host, port)
+        self.workers[(host, port)] = worker
+        LOGGER.info("Registered Worker %s", worker)
+        self.send_to_worker(worker, {"message_type": "register_ack"})
+
+    def send_to_worker(self, worker, message):
+        """Send a message to a Worker; mark it dead if it can't be reached.
+
+        Return True if the message was sent.
+        """
+        try:
+            tcp_send(worker.host, worker.port, message)
+        except ConnectionRefusedError:
+            LOGGER.warning("Connection refused, marking dead %s", worker)
+            worker.state = "dead"
+            return False
+        return True
+
+    def shutdown(self):
+        """Tell every living Worker to shut down, then stop the Manager."""
+        LOGGER.info("shutting down")
+        for worker in self.workers.values():
+            if worker.state != "dead":
+                self.send_to_worker(worker, {"message_type": "shutdown"})
+        self.shutdown_event.set()
 
 
 @click.command()
