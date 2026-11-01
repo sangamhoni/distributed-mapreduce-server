@@ -21,6 +21,32 @@ LOGGER = logging.getLogger(__name__)
 # A Worker that misses more than 5 heartbeats (sent every 2s) is dead.
 HEARTBEAT_TIMEOUT = 5 * 2
 
+# Fields each incoming TCP message must have, and their types.  Messages
+# that don't match are invalid and get ignored.
+REQUIRED_FIELDS = {
+    "shutdown": {},
+    "register": {"worker_host": str, "worker_port": int},
+    "finished": {"task_id": int, "worker_host": str, "worker_port": int},
+    "new_manager_job": {
+        "input_directory": str,
+        "output_directory": str,
+        "mapper_executable": str,
+        "reducer_executable": str,
+        "num_mappers": int,
+        "num_reducers": int,
+    },
+}
+
+
+def is_valid(message):
+    """Return True if message has every field its type needs."""
+    fields = REQUIRED_FIELDS.get(message.get("message_type"))
+    if fields is None:
+        return False
+    return all(
+        isinstance(message.get(name), kind) for name, kind in fields.items()
+    )
+
 
 @dataclass
 class RemoteWorker:
@@ -136,9 +162,14 @@ class Manager:
 
             # Commands arrive over TCP in this (main) thread.  This call
             # blocks until shutdown.
-            mapreduce.utils.tcp_server(
-                self.address, self.shutdown_event, self.handle_message
-            )
+            try:
+                mapreduce.utils.tcp_server(
+                    self.address, self.shutdown_event, self.handle_message
+                )
+            finally:
+                # Even if the server loop crashed, stop the other threads so
+                # the process can exit instead of hanging.
+                self.shutdown_event.set()
 
             # Don't leave the constructor until every thread has stopped.
             heartbeat_thread.join()
@@ -188,7 +219,10 @@ class Manager:
 
     def handle_message(self, message):
         """Dispatch one TCP message based on its message_type."""
-        message_type = message.get("message_type")
+        if not is_valid(message):
+            LOGGER.warning("Ignoring invalid message %s", message)
+            return
+        message_type = message["message_type"]
         if message_type == "shutdown":
             self.shutdown()
         elif message_type == "register":
@@ -241,8 +275,10 @@ class Manager:
         """
         try:
             mapreduce.utils.tcp_send((worker.host, worker.port), message)
-        except ConnectionRefusedError:
-            LOGGER.warning("Connection refused, marking dead %s", worker)
+        except OSError as error:
+            # ConnectionRefusedError (the spec's case) or any other network
+            # failure: the Worker can't be reached.
+            LOGGER.warning("%r, marking dead %s", error, worker)
             self.mark_dead(worker)
             return False
         return True
@@ -330,10 +366,13 @@ class Manager:
     def shutdown(self):
         """Tell every living Worker to shut down, then stop the Manager."""
         LOGGER.info("shutting down")
-        for worker in self.workers.values():
-            if worker.state != "dead":
-                self.send_to_worker(worker, {"message_type": "shutdown"})
-        self.shutdown_event.set()
+        try:
+            for worker in self.workers.values():
+                if worker.state != "dead":
+                    self.send_to_worker(worker, {"message_type": "shutdown"})
+        finally:
+            # Stop no matter what happened while forwarding.
+            self.shutdown_event.set()
 
 
 @click.command()
