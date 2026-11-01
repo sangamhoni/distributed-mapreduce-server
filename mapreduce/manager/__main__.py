@@ -7,6 +7,7 @@ import threading
 import queue
 import shutil
 import collections
+import time
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -16,6 +17,9 @@ import mapreduce.utils
 
 # Configure logging
 LOGGER = logging.getLogger(__name__)
+
+# A Worker that misses more than 5 heartbeats (sent every 2s) is dead.
+HEARTBEAT_TIMEOUT = 5 * 2
 
 
 @dataclass
@@ -27,6 +31,8 @@ class RemoteWorker:
     state: str = "ready"  # "ready", "busy", or "dead"
     # Task message it's working on, if busy (left out of the log output).
     task: Optional[dict] = field(default=None, repr=False)
+    # When we last heard from it; registering counts as hearing from it.
+    last_heartbeat: float = field(default_factory=time.time, repr=False)
 
 
 @dataclass
@@ -124,6 +130,10 @@ class Manager:
             job_thread = threading.Thread(target=self.run_jobs)
             job_thread.start()
 
+            # Another thread looks for Workers that stopped sending heartbeats.
+            fault_thread = threading.Thread(target=self.check_heartbeats)
+            fault_thread.start()
+
             # Commands arrive over TCP in this (main) thread.  This call
             # blocks until shutdown.
             mapreduce.utils.tcp_server(
@@ -133,11 +143,48 @@ class Manager:
             # Don't leave the constructor until every thread has stopped.
             heartbeat_thread.join()
             job_thread.join()
+            fault_thread.join()
         LOGGER.info("Cleaned up tmpdir %s", tmpdir)
 
     def handle_heartbeat(self, message):
-        """Handle one UDP heartbeat (tracking comes with fault tolerance)."""
+        """Record that a registered, living Worker is still alive."""
         LOGGER.debug("UDP recv\n%s", json.dumps(message, indent=2))
+        key = (message.get("worker_host"), message.get("worker_port"))
+        with self.stage.condition:
+            if key not in self.workers or self.workers[key].state == "dead":
+                # The spec says to ignore these; a dead Worker must register
+                # again to come back.
+                LOGGER.debug("Ignoring heartbeat from %s", key)
+                return
+            self.workers[key].last_heartbeat = time.time()
+
+    def check_heartbeats(self):
+        """Mark Workers dead once they've been silent too long."""
+        while not self.shutdown_event.is_set():
+            now = time.time()
+            with self.stage.condition:
+                for worker in self.workers.values():
+                    if worker.state != "dead" and \
+                            now - worker.last_heartbeat > HEARTBEAT_TIMEOUT:
+                        LOGGER.warning("Missed heartbeats from %s", worker)
+                        self.mark_dead(worker)
+            # Check about once a second; wake immediately on shutdown.
+            self.shutdown_event.wait(1)
+
+    def mark_dead(self, worker):
+        """Stop using a Worker and put its unfinished task back in line.
+
+        Dead Workers stay in self.workers, as the spec requires.
+        """
+        with self.stage.condition:
+            worker.state = "dead"
+            if worker.task is not None:
+                LOGGER.info("Reassigning task %s", worker.task["task_id"])
+                # Back of the line: the spec says hand out all of this stage's
+                # new tasks before tasks from dead Workers.
+                self.stage.pending.append(worker.task)
+                worker.task = None
+            self.stage.condition.notify_all()
 
     def handle_message(self, message):
         """Dispatch one TCP message based on its message_type."""
@@ -158,6 +205,12 @@ class Manager:
         host = message["worker_host"]
         port = message["worker_port"]
         with self.stage.condition:
+            old = self.workers[(host, port)] \
+                if (host, port) in self.workers else None
+            if old is not None and old.task is not None:
+                # It died and restarted before we noticed, so the task it
+                # had is lost; run it again.
+                self.mark_dead(old)
             worker = RemoteWorker(host, port)
             self.workers[(host, port)] = worker
             LOGGER.info("Registered Worker %s", worker)
@@ -190,7 +243,7 @@ class Manager:
             mapreduce.utils.tcp_send((worker.host, worker.port), message)
         except ConnectionRefusedError:
             LOGGER.warning("Connection refused, marking dead %s", worker)
-            worker.state = "dead"
+            self.mark_dead(worker)
             return False
         return True
 
