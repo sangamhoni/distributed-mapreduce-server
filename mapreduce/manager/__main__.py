@@ -5,12 +5,29 @@ import logging
 import json
 import socket
 import threading
+from dataclasses import dataclass
 import click
 import mapreduce.utils
 
 
 # Configure logging
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class RemoteWorker:
+    """The Manager's view of one registered Worker."""
+
+    host: str
+    port: int
+    state: str = "ready"  # "ready", "busy", or "dead"
+
+
+def tcp_send(host, port, message):
+    """Send one JSON message to host:port over a new TCP connection."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.connect((host, port))
+        sock.sendall(json.dumps(message).encode("utf-8"))
 
 
 def receive_all(clientsocket):
@@ -54,6 +71,9 @@ class Manager:
 
         # Every thread checks this flag; setting it tells them all to stop.
         self.shutdown_event = threading.Event()
+
+        # Registered Workers keyed by (host, port), in registration order.
+        self.workers = mapreduce.utils.ThreadSafeOrderedDict()
 
         prefix = "mapreduce-shared-"
         with tempfile.TemporaryDirectory(prefix=prefix) as tmpdir:
@@ -117,12 +137,39 @@ class Manager:
         message_type = message.get("message_type")
         if message_type == "shutdown":
             self.shutdown()
+        elif message_type == "register":
+            self.register_worker(message)
         else:
             LOGGER.warning("Unhandled message_type %s", message_type)
 
+    def register_worker(self, message):
+        """Record a new Worker and acknowledge it."""
+        host = message["worker_host"]
+        port = message["worker_port"]
+        worker = RemoteWorker(host, port)
+        self.workers[(host, port)] = worker
+        LOGGER.info("Registered Worker %s", worker)
+        self.send_to_worker(worker, {"message_type": "register_ack"})
+
+    def send_to_worker(self, worker, message):
+        """Send a message to a Worker; mark it dead if it can't be reached.
+
+        Return True if the message was sent.
+        """
+        try:
+            tcp_send(worker.host, worker.port, message)
+        except ConnectionRefusedError:
+            LOGGER.warning("Connection refused, marking dead %s", worker)
+            worker.state = "dead"
+            return False
+        return True
+
     def shutdown(self):
-        """Stop the Manager: every thread's loop exits on its next check."""
+        """Tell every living Worker to shut down, then stop the Manager."""
         LOGGER.info("shutting down")
+        for worker in self.workers.values():
+            if worker.state != "dead":
+                self.send_to_worker(worker, {"message_type": "shutdown"})
         self.shutdown_event.set()
 
 
