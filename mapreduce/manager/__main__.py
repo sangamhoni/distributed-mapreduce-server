@@ -5,6 +5,9 @@ import logging
 import json
 import socket
 import threading
+import queue
+import shutil
+from pathlib import Path
 from dataclasses import dataclass
 import click
 import mapreduce.utils
@@ -75,14 +78,22 @@ class Manager:
         # Registered Workers keyed by (host, port), in registration order.
         self.workers = mapreduce.utils.ThreadSafeOrderedDict()
 
+        # Jobs waiting to run, oldest first.  The next job gets this id.
+        self.job_queue = queue.Queue()
+        self.next_job_id = 0
+
         prefix = "mapreduce-shared-"
         with tempfile.TemporaryDirectory(prefix=prefix) as tmpdir:
             LOGGER.info("Created tmpdir %s", tmpdir)
-            self.tmpdir = tmpdir
+            self.tmpdir = Path(tmpdir)
 
             # Heartbeats arrive over UDP in a background thread.
             heartbeat_thread = threading.Thread(target=self.listen_udp)
             heartbeat_thread.start()
+
+            # Jobs run one at a time in their own background thread.
+            job_thread = threading.Thread(target=self.run_jobs)
+            job_thread.start()
 
             # Commands arrive over TCP in this (main) thread.  This call
             # blocks until shutdown.
@@ -90,6 +101,7 @@ class Manager:
 
             # Don't leave the constructor until every thread has stopped.
             heartbeat_thread.join()
+            job_thread.join()
         LOGGER.info("Cleaned up tmpdir %s", tmpdir)
 
     def listen_tcp(self):
@@ -139,6 +151,8 @@ class Manager:
             self.shutdown()
         elif message_type == "register":
             self.register_worker(message)
+        elif message_type == "new_manager_job":
+            self.new_job(message)
         else:
             LOGGER.warning("Unhandled message_type %s", message_type)
 
@@ -163,6 +177,35 @@ class Manager:
             worker.state = "dead"
             return False
         return True
+
+    def new_job(self, message):
+        """Give a submitted job an id and add it to the job queue."""
+        job = dict(message)
+        job["job_id"] = self.next_job_id
+        self.next_job_id += 1
+        self.job_queue.put(job)
+        LOGGER.info("Queued job %s", job["job_id"])
+
+    def run_jobs(self):
+        """Run queued jobs one at a time until shutdown."""
+        while not self.shutdown_event.is_set():
+            try:
+                job = self.job_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            self.run_job(job)
+
+    def run_job(self, job):
+        """Run one MapReduce job to completion."""
+        output_dir = Path(job["output_directory"])
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+        output_dir.mkdir(parents=True)
+        LOGGER.info("Created %s", output_dir)
+
+        job_dir = self.tmpdir / f"job-{job['job_id']:05d}"
+        job_dir.mkdir()
+        LOGGER.info("Created %s", job_dir)
 
     def shutdown(self):
         """Tell every living Worker to shut down, then stop the Manager."""
