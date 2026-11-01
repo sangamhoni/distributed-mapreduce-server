@@ -35,7 +35,8 @@ start() {
 
 stop() {
   echo "stopping mapreduce ..."
-  mapreduce-submit --shutdown --host localhost --port 6000 || true
+  # Hide submit's own output so we print exactly what the spec shows
+  mapreduce-submit --shutdown --host localhost --port 6000 &> /dev/null || true
   sleep 2  # give the Manager time to receive signal and send to Workers
 
   # Force-kill anything that ignored the shutdown message
