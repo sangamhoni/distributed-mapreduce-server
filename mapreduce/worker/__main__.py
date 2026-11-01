@@ -132,10 +132,15 @@ class Worker:
         # Messages from the Manager arrive over TCP in this (main) thread.
         # Register only once the socket is listening, so the register_ack
         # reply has somewhere to go.  This call blocks until shutdown.
-        mapreduce.utils.tcp_server(
-            self.address, self.shutdown_event, self.handle_message,
-            on_listen=self.register,
-        )
+        try:
+            mapreduce.utils.tcp_server(
+                self.address, self.shutdown_event, self.handle_message,
+                on_listen=self.register,
+            )
+        finally:
+            # Even if the server loop crashed, stop the heartbeat thread so
+            # the process can exit instead of hanging.
+            self.shutdown_event.set()
 
         # Don't leave the constructor until every thread has stopped.
         if self.heartbeat_thread is not None:

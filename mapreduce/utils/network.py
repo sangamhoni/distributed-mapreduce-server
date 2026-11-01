@@ -81,7 +81,13 @@ def tcp_server(address, shutdown_event, handle_func, on_listen=None):
             if message is None:
                 continue
             LOGGER.debug("TCP recv\n%s", json.dumps(message, indent=2))
-            handle_func(message)
+            try:
+                handle_func(message)
+            except (KeyError, TypeError, ValueError) as error:
+                # Missing or wrongly typed fields: an invalid message, which
+                # the spec says to ignore.  Keep listening.
+                LOGGER.warning("Ignoring invalid message %s: %r",
+                               message, error)
 
 
 def udp_server(address, shutdown_event, handle_func):
@@ -101,4 +107,8 @@ def udp_server(address, shutdown_event, handle_func):
             message = decode_message(message_bytes)
             if message is None:
                 continue
-            handle_func(message)
+            try:
+                handle_func(message)
+            except (KeyError, TypeError, ValueError) as error:
+                LOGGER.warning("Ignoring invalid message %s: %r",
+                               message, error)

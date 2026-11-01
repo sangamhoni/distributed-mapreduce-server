@@ -27,10 +27,16 @@ start() {
   echo "starting mapreduce ..."
   mkdir -p var/log
   rm -f var/log/manager.log var/log/worker-6002.log var/log/worker-6001.log
-  mapreduce-manager --host localhost --port 6000 --logfile var/log/manager.log &
+  # Detach the servers from this script's stdin/stdout/stderr (they log to
+  # var/log).  Otherwise a caller capturing our output waits for them to
+  # exit, i.e., forever.
+  mapreduce-manager --host localhost --port 6000 --logfile var/log/manager.log \
+    < /dev/null &> /dev/null &
   sleep 2  # give the Manager time to start
-  mapreduce-worker --host localhost --port 6001 --manager-host localhost --manager-port 6000 --logfile var/log/worker-6001.log &
-  mapreduce-worker --host localhost --port 6002 --manager-host localhost --manager-port 6000 --logfile var/log/worker-6002.log &
+  mapreduce-worker --host localhost --port 6001 --manager-host localhost --manager-port 6000 --logfile var/log/worker-6001.log \
+    < /dev/null &> /dev/null &
+  mapreduce-worker --host localhost --port 6002 --manager-host localhost --manager-port 6000 --logfile var/log/worker-6002.log \
+    < /dev/null &> /dev/null &
 }
 
 stop() {
