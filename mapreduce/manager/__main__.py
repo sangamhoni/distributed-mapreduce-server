@@ -7,8 +7,10 @@ import socket
 import threading
 import queue
 import shutil
+import collections
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 import click
 import mapreduce.utils
 
@@ -24,6 +26,25 @@ class RemoteWorker:
     host: str
     port: int
     state: str = "ready"  # "ready", "busy", or "dead"
+    # Task message it's working on, if busy (left out of the log output).
+    task: Optional[dict] = field(default=None, repr=False)
+
+
+@dataclass
+class Stage:
+    """Tasks of the running stage, shared by the job and main threads.
+
+    The job thread hands out tasks and the main thread records finished
+    ones, so both hold `condition` while touching this or a Worker's state.
+    """
+
+    condition: threading.Condition = field(
+        default_factory=threading.Condition
+    )
+    pending: collections.deque = field(
+        default_factory=collections.deque
+    )  # not yet assigned to a Worker
+    remaining: int = 0  # assigned or not, but not finished yet
 
 
 def tcp_send(host, port, message):
@@ -31,6 +52,25 @@ def tcp_send(host, port, message):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.connect((host, port))
         sock.sendall(json.dumps(message).encode("utf-8"))
+
+
+def make_map_tasks(job, job_dir):
+    """Split a job's input files round robin into new_map_task messages."""
+    input_files = sorted(Path(job["input_directory"]).iterdir())
+    num_mappers = job["num_mappers"]
+    tasks = []
+    for task_id in range(num_mappers):
+        # Files task_id, task_id + num_mappers, task_id + 2*num_mappers, ...
+        partition = input_files[task_id::num_mappers]
+        tasks.append({
+            "message_type": "new_map_task",
+            "task_id": task_id,
+            "input_paths": [str(path) for path in partition],
+            "executable": job["mapper_executable"],
+            "output_directory": str(job_dir),
+            "num_partitions": job["num_reducers"],
+        })
+    return tasks
 
 
 def receive_all(clientsocket):
@@ -69,8 +109,7 @@ class Manager:
             "Starting manager host=%s port=%s pwd=%s",
             host, port, os.getcwd(),
         )
-        self.host = host
-        self.port = port
+        self.address = (host, port)
 
         # Every thread checks this flag; setting it tells them all to stop.
         self.shutdown_event = threading.Event()
@@ -81,6 +120,9 @@ class Manager:
         # Jobs waiting to run, oldest first.  The next job gets this id.
         self.job_queue = queue.Queue()
         self.next_job_id = 0
+
+        # Task bookkeeping for the stage (map or reduce) that's running.
+        self.stage = Stage()
 
         prefix = "mapreduce-shared-"
         with tempfile.TemporaryDirectory(prefix=prefix) as tmpdir:
@@ -108,10 +150,10 @@ class Manager:
         """Accept TCP connections and handle one JSON message from each."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((self.host, self.port))
+            sock.bind(self.address)
             sock.listen()
             sock.settimeout(1)
-            LOGGER.info("Listening on TCP port %s", self.port)
+            LOGGER.info("Listening on TCP port %s", self.address[1])
 
             while not self.shutdown_event.is_set():
                 try:
@@ -129,9 +171,9 @@ class Manager:
         """Receive UDP heartbeat messages until shutdown."""
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((self.host, self.port))
+            sock.bind(self.address)
             sock.settimeout(1)
-            LOGGER.info("Listening on UDP port %s", self.port)
+            LOGGER.info("Listening on UDP port %s", self.address[1])
 
             while not self.shutdown_event.is_set():
                 try:
@@ -153,6 +195,8 @@ class Manager:
             self.register_worker(message)
         elif message_type == "new_manager_job":
             self.new_job(message)
+        elif message_type == "finished":
+            self.task_finished(message)
         else:
             LOGGER.warning("Unhandled message_type %s", message_type)
 
@@ -160,10 +204,29 @@ class Manager:
         """Record a new Worker and acknowledge it."""
         host = message["worker_host"]
         port = message["worker_port"]
-        worker = RemoteWorker(host, port)
-        self.workers[(host, port)] = worker
-        LOGGER.info("Registered Worker %s", worker)
-        self.send_to_worker(worker, {"message_type": "register_ack"})
+        with self.stage.condition:
+            worker = RemoteWorker(host, port)
+            self.workers[(host, port)] = worker
+            LOGGER.info("Registered Worker %s", worker)
+            self.send_to_worker(worker, {"message_type": "register_ack"})
+            # A job may be waiting for a free Worker; wake it up.
+            self.stage.condition.notify_all()
+
+    def task_finished(self, message):
+        """Mark a Worker ready again after it finishes its task."""
+        key = (message["worker_host"], message["worker_port"])
+        with self.stage.condition:
+            if key not in self.workers:
+                return
+            worker = self.workers[key]
+            if worker.task is None or \
+                    worker.task["task_id"] != message["task_id"]:
+                return
+            LOGGER.info("Finished task %s %s", message["task_id"], worker)
+            worker.task = None
+            worker.state = "ready"
+            self.stage.remaining -= 1
+            self.stage.condition.notify_all()
 
     def send_to_worker(self, worker, message):
         """Send a message to a Worker; mark it dead if it can't be reached.
@@ -206,6 +269,45 @@ class Manager:
         job_dir = self.tmpdir / f"job-{job['job_id']:05d}"
         job_dir.mkdir()
         LOGGER.info("Created %s", job_dir)
+
+        LOGGER.info("Begin Map Stage")
+        self.run_stage(make_map_tasks(job, job_dir))
+        if self.shutdown_event.is_set():
+            return
+        LOGGER.info("End Map Stage")
+
+    def run_stage(self, tasks):
+        """Give tasks to ready Workers; return when all have finished.
+
+        Also return early if the Manager is shutting down.
+        """
+        with self.stage.condition:
+            self.stage.pending = collections.deque(tasks)
+            self.stage.remaining = len(tasks)
+            while self.stage.remaining > 0 \
+                    and not self.shutdown_event.is_set():
+                worker = self.next_ready_worker()
+                if self.stage.pending and worker is not None:
+                    self.assign_task(worker, self.stage.pending.popleft())
+                else:
+                    # Sleep until a Worker registers or finishes.
+                    self.stage.condition.wait(timeout=1)
+
+    def next_ready_worker(self):
+        """Return the earliest-registered ready Worker, or None."""
+        for worker in self.workers.values():
+            if worker.state == "ready":
+                return worker
+        return None
+
+    def assign_task(self, worker, task):
+        """Send a task to a Worker; put it back in line if that fails."""
+        if self.send_to_worker(worker, task):
+            worker.state = "busy"
+            worker.task = task
+            LOGGER.info("Assigned task %s to %s", task["task_id"], worker)
+        else:
+            self.stage.pending.appendleft(task)
 
     def shutdown(self):
         """Tell every living Worker to shut down, then stop the Manager."""
