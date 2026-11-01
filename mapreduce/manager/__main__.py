@@ -18,8 +18,9 @@ import mapreduce.utils
 # Configure logging
 LOGGER = logging.getLogger(__name__)
 
-# A Worker that misses more than 5 heartbeats (sent every 2s) is dead.
-HEARTBEAT_TIMEOUT = 5 * 2
+# A Worker that misses more than 5 heartbeats in a row is dead.  Heartbeats
+# come every 2s, so "more than 5" missed means 6 * 2 = 12s of silence.
+HEARTBEAT_TIMEOUT = 6 * 2
 
 # Fields each incoming TCP message must have, and their types.  Messages
 # that don't match are invalid and get ignored.
